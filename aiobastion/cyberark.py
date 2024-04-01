@@ -4,7 +4,7 @@ import os.path
 import asyncio
 import json
 import ssl
-from typing import Tuple
+from typing import Tuple, Optional
 import copy
 
 from aiohttp import ContentTypeError
@@ -29,6 +29,13 @@ class EPV:
     """
     Class that represent the connection, or future connection, to the Vault.
     """
+    # Default value
+    CYBERARK_DEFAULT_KEEP_COOKIES = False
+    CYBERARK_DEFAULT_MAX_CONCURRENT_TASKS = 10
+    CYBERARK_DEFAULT_RETENTION = 10
+    CYBERARK_DEFAULT_TIMEOUT = 30
+    CYBERARK_DEFAULT_VERIFY = True
+    CYBERARK_OPTIONS_MODULES_LIST = [ "AIM", "account", "safe"]
 
     def __init__(self, configfile: str = None, serialized: dict = None, token: str = None):
         # Logging stuff
@@ -40,11 +47,12 @@ class EPV:
         self.authtype = "cyberark"          # CyberArk authentification type
 
         # Number of parallel task for PVWA and AIM
-        self.max_concurrent_tasks = Config.CYBERARK_DEFAULT_MAX_CONCURRENT_TASKS
+        self.max_concurrent_tasks = EPV.CYBERARK_DEFAULT_MAX_CONCURRENT_TASKS
         # Communication timeout in seconds
-        self.timeout = Config.CYBERARK_DEFAULT_TIMEOUT
-        self.keep_cookies = False           # Whether to keep cookies between API calls
-        self.verify = Config.CYBERARK_DEFAULT_VERIFY                 # root certificate authority (CA)self.keep_cookies = False   # Whether to keep cookies between API calls
+        self.timeout = EPV.CYBERARK_DEFAULT_TIMEOUT
+
+        self.keep_cookies = EPV.CYBERARK_DEFAULT_KEEP_COOKIES     # Whether to keep cookies between API calls
+        self.verify = EPV.CYBERARK_DEFAULT_VERIFY                 # root certificate authority (CA)
 
         self.request_params = {"timeout": self.timeout, "ssl": False}          # timeout & ssl setupn default value
         self.__token = token                # CyberArk authorization token
@@ -52,22 +60,24 @@ class EPV:
         # AIM Communication initialization
         self.AIM = None                     # EPV_AIM definition
 
-        # Linked accounts index defaults, can be overriden by configs
-        self.LOGON_ACCOUNT_INDEX = 2        # This really should be 1, but keep as 2 for backward compatibility
-        self.RECONCILE_ACCOUNT_INDEX = 3    # You SHOULD NOT change this, except for backward compatibility
+        # Parameter specific to a module
+        options_modules = {}
+
+        for module in EPV.CYBERARK_OPTIONS_MODULES_LIST:
+            options_modules[module] = {}
+
 
         # Other section initialization
         self.configfile = configfile        # Name of the configuration file
         self.config = None                  # Definition from the configuration file
-        self.cpm = ""                       # CPM to assign to safes
-        self.retention = Config.CYBERARK_DEFAULT_RETENTION  # days of retention for objects in safe
+        self.retention = EPV.CYBERARK_DEFAULT_RETENTION  # days of retention for objects in safe
 
         if configfile is None and serialized is None:
             raise AiobastionException("You must provide either configfile or serialized to init EPV")
         elif configfile is not None and serialized is None:
-            self._epv_config(configfile)
+            options_modules = self._epv_config(configfile)
         elif serialized is not None and configfile is None:
-            self._epv_serialize(serialized)
+            options_modules = self._epv_serialize(serialized)
         else:
             raise AiobastionException("You must provide either configfile or serialized to init EPV, not both")
 
@@ -79,10 +89,14 @@ class EPV:
         self.__sema = None
 
         # utilities
-        self.account = Account(self)
+        if "AIM" in options_modules:
+            # Do not define AIM if not necessary.
+            self.AIM = EPV_AIM(**options_modules["AIM"])
+
+        self.account = Account(self, **options_modules["account"])
         self.platform = Platform(self)
         self.session_management = SessionManagement(self)
-        self.safe = Safe(self)
+        self.safe = Safe(self, **options_modules["safe"])
         self.user = User(self)
         self.group = Group(self)
         self.application = Applications(self)
@@ -90,10 +104,6 @@ class EPV:
         self.system_health = SystemHealth(self)
         self.utils = Utilities(self)
 
-    def _epv_set_linked_account_index(self, custom):
-        if custom is not None:
-            if custom['LOGON_ACCOUNT_INDEX']: self.LOGON_ACCOUNT_INDEX = int(custom['LOGON_ACCOUNT_INDEX']) # noqa:
-            if custom['RECONCILE_ACCOUNT_INDEX']: self.RECONCILE_ACCOUNT_INDEX = int(custom['RECONCILE_ACCOUNT_INDEX']) # noqa:
 
     def _epv_config(self, configfile):
         self.config = Config(configfile)
@@ -110,17 +120,15 @@ class EPV:
         if self.config.AIM is not None:
             self.AIM = EPV_AIM(**self.config.AIM)
 
-        # Other definition
-        self.cpm = self.config.CPM
-        self.retention = self.config.retention
+        return self.config.options_modules
 
-        self._epv_set_linked_account_index(self.config.custom)
-
-    def _epv_serialize(self, serialized):
+    def _epv_serialize(self, serialized) -> dict:
         if not isinstance(serialized, dict):
             raise AiobastionException("Type error: Parameter 'serialized' must be a dictionary.")
 
-        # Validate dictionary key
+        options_modules = {}
+
+        # Validate dictionary keys
         for k in serialized.keys():
             if k not in [
                 "AIM",
@@ -133,9 +141,9 @@ class EPV:
                 "token",
                 "keep_cookies",
                 "verify",
-                "custom",
             ]:
-                raise AiobastionException(f"Unknown serialized field: {k} = {serialized[k]!r}")
+                if k not in EPV.CYBERARK_OPTIONS_MODULES_LIST:
+                    raise AiobastionException(f"Unknown serialized field: {k} = {serialized[k]!r}")
 
         # PVWA definition
         if "api_host" in serialized:
@@ -152,32 +160,58 @@ class EPV:
             self.verify = serialized["verify"]
         if "token" in serialized:
             self.__token = serialized['token']
-        if "custom" in serialized:
-            self.custom = serialized['custom']
-            self._epv_set_linked_account_index(self.custom)
+
+        # Options modules
+        options_modules = {}
 
         # AIM Communication
         if "AIM" in serialized:
-            serialized_aim = copy.copy(serialized["AIM"])
+            serialized_aim = EPV_AIM._init_validate_class_attributes(serialized, "AIM")
 
-            serialized_aim.setdefault("host", getattr(self, "api_host", None))
-            serialized_aim.setdefault(
-                "max_concurrent_tasks",
-                getattr(self, "max_concurrent_tasks", Config.CYBERARK_DEFAULT_MAX_CONCURRENT_TASKS))
-            serialized_aim.setdefault("timeout", getattr(self, "timeout", Config.CYBERARK_DEFAULT_TIMEOUT))
-            serialized_aim.setdefault("verify", getattr(self, "verify", False))
-            serialized_aim.setdefault("keep_cookies", getattr(self, "keep_cookies", False))
-            self.AIM = EPV_AIM(serialized=serialized_aim)
+            # Value that may come from PVWA
+            pvwa = {
+                "appid": None,
+                "host": self.api_host,
+                "timeout": self.timeout,
+                "max_concurrent_tasks": self.max_concurrent_tasks,
+                "verify": self.verify
+            }
 
-        # Other definition
-        if "cpm" in serialized:
-            self.cpm = serialized['cpm']
+            options_modules["aim"] = EPV_AIM._init_complete_with_pvwa(serialized_aim, pvwa, "AIM")
+
+        if "account" in serialized:
+            options_modules["account"] = \
+                Account._init_validate_class_attributes(serialized['account'], "account")
+        else:
+            options_modules["account"] = \
+                Account._init_validate_class_attributes({}, "account")
+
         if "retention" in serialized:
-            self.retention = serialized['retention']
+            options_modules["safe"]["retention"] = serialized['retention']
+
+
+        if "safe" in serialized and \
+            ("cmp" in serialized or "retention" in serialized):
+            raise AiobastionException("Remove cmp' and 'retention' if you specify 'safe'.")
+
+        if "safe" in serialized:
+            options_modules["safe"] = Safe.check_parm(serialized["safe"])
+        else:
+            options_modules["safe"] = {}
+
+        if "cpm" in serialized:
+            options_modules["safe"]["cpm"] = serialized["cpm"]
+
+        if "retention" in serialized:
+            options_modules["safe"]["retention"] = int(serialized["retention"])
+
+
+
+        return options_modules
 
     def validate_and_setup_ssl(self):
         if self.verify is None:
-            self.verify = Config.CYBERARK_DEFAULT_VERIFY
+            self.verify = EPV.CYBERARK_DEFAULT_VERIFY
 
         if not (isinstance(self.verify, str) or isinstance(self.verify, bool)):
             raise AiobastionException(f"Invalid type for parameter 'verify' (or 'CA') in PVWA: {type(self.verify)} value: {self.verify!r}")
@@ -265,7 +299,7 @@ class EPV:
 
         return True
 
-    async def check_token(self) -> bool or None:
+    async def check_token(self) -> Optional[bool]:
         if self.__token is None:
             return None
 
@@ -285,16 +319,27 @@ class EPV:
 
     async def login_with_aim(self, aim_host: str = None, appid: str = None, username: str = None, cert_file: str = None,
                              cert_key: str = None, root_ca=None, timeout: int = None, max_concurrent_tasks: int = None,
-                             user_search: dict = None, auth_type=None):
-        """ Authenticate the PVWA user using AIM interface to get the secret (password) in CyberArk.
+                             user_search: dict = None, auth_type=None, cert_passphrase=None, keep_cookies=None):
+        """ Authenticate the PVWA user using AIM interface to get password (secret).
 
-        We only support client certificate authentication to the AIM
+        We only support client certificate authentication to the AIM.
+
 
         | ℹ️ The following parameters are optional. If a parameter is not set, it will be obtained
             from *EPV* initialization (configuration file or serialization).
 
         | ⚠️ Any specified parameter from the *login_with_aim* function will override the *EPV_AIM*
             definition.
+
+
+        * The function parameter behavoir toward login initialization (configuration: file or serialization):
+            * If a parameter is set:
+                * an AIM session is not open:
+                    * the AIM configuration (EPV.AIM) is modifed
+                * an AIM session is open and the value is different from AIM configuration (EPV.AIM)
+                    * a error will be raise
+            * If a parameter is not set:
+                *  it will be obtained from AIM configuration (EPV.AIM)
 
         :param aim_host: *AIM* CyberArk host
         :param appid: *AIM* Application ID
@@ -306,6 +351,7 @@ class EPV:
         :param username: *PVWA* Name of the user who is logging in to the Vault (PVWA username)
         :param auth_type: *PVWA* logon authenticafication method: CyberArk, Windows, LDAP or Radius
         :param user_search: *PVWA* Search parameters to uniquely identify the PVWA user (optional).
+        :param cert_passphrase: *AIM* Certificat password
         :type user_search: *PVWA* Dictionary
 
         |     **user_search** dictionary may define any of the following keys:
@@ -336,6 +382,10 @@ class EPV:
                     self.AIM.timeout = timeout
                 if max_concurrent_tasks:
                     self.AIM.max_concurrent_tasks = max_concurrent_tasks
+                if cert_passphrase:
+                    self.AIM.passphrase = cert_passphrase
+                if keep_cookies:
+                    self.AIM.keep_cookies = keep_cookies
 
                 # Valide AIM setup
                 self.AIM.validate_and_setup_aim_ssl()
@@ -347,6 +397,8 @@ class EPV:
             cert_key = (cert_key or self.AIM.key)
             timeout = (timeout or self.AIM.timeout or self.timeout)
             max_concurrent_tasks = (max_concurrent_tasks or self.AIM.max_concurrent_tasks or self.max_concurrent_tasks)
+            cert_passphrase = (cert_passphrase or self.AIM.passphrase)
+            keep_cookies = (keep_cookies or self.AIM.keep_cookies)
 
             if root_ca is None:   # May be false
                 if self.AIM.verify is not None:
@@ -355,23 +407,25 @@ class EPV:
                     if self.verify is not None:
                         root_ca = self.verify  # PVWA
                     else:
-                        root_ca = Config.CYBERARK_DEFAULT_VERIFY
+                        root_ca = EPV.CYBERARK_DEFAULT_VERIFY
 
             if (aim_host and aim_host != self.AIM.host) or \
                     (appid and appid != self.AIM.appid) or \
                     (cert_file and cert_file != self.AIM.cert) or \
                     (cert_key and cert_key != self.AIM.key) or \
-                    (root_ca is not None and root_ca != self.AIM.verify):
+                    (root_ca is not None and root_ca != self.AIM.verify) or \
+                    (cert_passphrase and  cert_passphrase != self.AIM.passphrase)    :
                 raise CyberarkException("AIM is already initialized ! Please close EPV before reopen it.")
         else:
+            # AIM is not defined
             if root_ca is None:
                 if self.verify is not None:
                     root_ca = self.verify  # PVWA
                 else:
-                    root_ca = Config.CYBERARK_DEFAULT_VERIFY
+                    root_ca = EPV.CYBERARK_DEFAULT_VERIFY
 
             self.AIM = EPV_AIM(host=aim_host, appid=appid, cert=cert_file, key=cert_key, verify=root_ca,
-                               timeout=timeout, max_concurrent_tasks=max_concurrent_tasks)
+                               timeout=timeout, max_concurrent_tasks=max_concurrent_tasks, passphrase=cert_passphrase)
 
             # Valid AIM setup
             self.AIM.validate_and_setup_aim_ssl()
@@ -379,10 +433,9 @@ class EPV:
         # Check mandatory attributs
         if self.AIM.host is None or \
                 self.AIM.appid is None or \
-                self.AIM.cert is None or \
-                self.AIM.key is None:
+                self.AIM.cert is None:
             raise AiobastionException(
-                "Missing AIM mandatory parameters: host, appid, cert, key (and a optional verify).")
+                "Missing AIM mandatory parameters: host, appid, cert.")
 
         # Complete undefined parameters with PVWA attributes
         if username is None and self.config and self.config.username:

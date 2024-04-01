@@ -3,20 +3,20 @@
 import yaml
 import warnings
 from .exceptions import AiobastionConfigurationException
+from .cyberark import EPV
+from .accounts import Account
+from .safe import Safe
+from .aim import EPV_AIM
+# from .aim import EPV_AIM
 
 
 class Config:
     """Parse a config file into an object"""
-    # Default value
-    CYBERARK_DEFAULT_TIMEOUT = 30
-    CYBERARK_DEFAULT_MAX_CONCURRENT_TASKS = 10
-    CYBERARK_DEFAULT_RETENTION = 10
-    CYBERARK_DEFAULT_VERIFY = False
 
     def __init__(self, configfile):
         self.configfile = configfile
 
-        # Global section Initialisation
+        # Global section initialization
         self.AIM = None
         self.Connection = None
         self.CPM = ""
@@ -25,19 +25,25 @@ class Config:
         self.Label = None
         self.retention = None
 
-        # Connection section Initialisation
+        # Connection section initialization
         self.appid = None
         self.authtype = "Cyberark"
         self.password = None
         self.user_search = None
         self.username = None
 
-        # PVWA section Initialisation
+        # PVWA section initialization
         self.PVWA = None
-        self.max_concurrent_tasks = Config.CYBERARK_DEFAULT_MAX_CONCURRENT_TASKS
-        self.timeout = Config.CYBERARK_DEFAULT_TIMEOUT
-        self.PVWA_CA = Config.CYBERARK_DEFAULT_VERIFY
-        self.keep_cookies = False
+        self.max_concurrent_tasks = EPV.CYBERARK_DEFAULT_MAX_CONCURRENT_TASKS
+        self.timeout = EPV.CYBERARK_DEFAULT_TIMEOUT
+        self.PVWA_CA = EPV.CYBERARK_DEFAULT_VERIFY
+        self.keep_cookies = EPV.CYBERARK_DEFAULT_KEEP_COOKIES
+
+        # Optional configuration like account, safe, ...
+        options_modules = {}
+
+        for module in EPV.CYBERARK_OPTIONS_MODULES_LIST:
+            self.options_modules[module] = {}
 
         with open(configfile, 'r') as config:
             configuration = yaml.safe_load(config)
@@ -46,9 +52,15 @@ class Config:
         for k in list(configuration.keys()):
             keyname = k.lower()
 
-            if keyname not in ["aim", "connection", "cpm", "custom",
-                               "customipfield", "label", "pvwa", "retention"]:
-                warnings.warn(f"aiobastion - Unknown section '{k}' in {self.configfile}")
+            if keyname not in [
+                               "aim", "connection", "cpm",
+                               "label", "pvwa", "retention",
+                               "custom",                # Customer use only (not aibastion)
+                               "customipfield",         # Compatibility - deprecated
+                               ]:
+
+                if keyname not in EPV.CYBERARK_OPTIONS_MODULES_LIST:
+                    warnings.warn(f"aiobastion - Unknown section '{k}' in {self.configfile}")
                 continue
 
             if k != keyname:
@@ -62,19 +74,49 @@ class Config:
         if "pvwa" in configuration and configuration["pvwa"]:
             self._read_section_pvwa(configuration["pvwa"])
 
-        if "aim" in configuration and configuration["aim"]:
-            self._read_section_aim(configuration["aim"])
-
-        if "cpm" in configuration:
-            self.CPM = configuration["cpm"]
         if "label" in configuration:
             self.label = configuration["label"]
         if "custom" in configuration:
             self.custom = configuration["custom"]
         if "customipfield" in configuration:
             self.customIPField = configuration["customipfield"]
+
+        # --------------------------------------------
+        # opions_modules
+        # --------------------------------------------
+        # AIM module
+        if "aim" in configuration and configuration["aim"]:
+            self.options_modules["AIM"] = self._read_section_aim(configuration["aim"])
+
+
+        # account module
+        if self.custom and \
+            ("LOGON_ACCOUNT_INDEX" in self.custom or
+             "RECONCILE_ACCOUNT_INDEX" in self.custom):
+            raise AiobastionConfigurationException("Please move from the custom to account section the 'logon_account_index' and 'reconcile_account_index' definition in {self.configfile}.")
+
+        if "account" in configuration and configuration["account"]:
+            self.options_modules["account"] = Account._init_validate_class_attributes(configuration["account"], "account", self.configfile)
+        else:
+            self.options_modules["account"] = Account._init_validate_class_attributes({}, "account", self.configfile)
+
+        # Safe module
+        if "safe" in configuration and \
+            ("cmp" in configuration or "retention" in configuration):
+            raise AiobastionConfigurationException("Please move from the global to account section the 'cmp' and 'retention' definition in {self.configfile}.")
+
+        if "safe" in configuration and configuration["safe"]:
+            self.options_modules["safe"] = Safe._init_validate_class_attributes(configuration["safe"], "safe", self.configfile)
+        else:
+            self.options_modules["safe"] = Safe._init_validate_class_attributes({}, "safe", self.configfile)
+
+        if "cpm" in configuration:
+            self.options_modules["safe"]["cpm"] = configuration["cpm"]  # module safe.py
+
         if "retention" in configuration:
-            self.retention = self._to_integer("retention", configuration["retention"])
+            self.options_modules["safe"]["retention"] = self._to_integer("retention", configuration["retention"])  # module safe.py
+
+
 
     def _read_section_connection(self, configuration):
         for k in list(configuration.keys()):
@@ -100,14 +142,12 @@ class Config:
                 raise AiobastionConfigurationException(f"Malformed attribute 'user_search' within section "
                                                        f"'connection' in {self.configfile}: {self.user_search!r}")
 
-            # Check user_search parameter name
-            _getPassword_request_parm = ["safe", "folder", "object",  "username", "address", "database", "policyid",
-                                         "reason", "connectiontimeout", "query", "queryformat",
-                                         "failrequestonpasswordchange" ]
 
             for k in list(self.user_search.keys()):
                 keyname = k.lower()
-                if keyname not in _getPassword_request_parm:
+
+                # Check user_search parameter name
+                if keyname not in EPV_AIM._GETPASSWORD_REQUEST_PARM:
                     raise AiobastionConfigurationException(f"Unknown attribute '{k}' within section "
                                                            f"'connection/user_search' in {self.configfile}")
 
@@ -115,8 +155,8 @@ class Config:
                     self.user_search[keyname] = self.user_search.pop(k)
 
     def _read_section_pvwa(self, configuration):
-        synonyme_PVWA_CA = 0
-        synonyme_max_concurrent_tasks = 0
+        synonym_PVWA_CA = 0
+        synonym_max_concurrent_tasks = 0
 
         for k in list(configuration.keys()):
             keyname = k.lower()
@@ -127,82 +167,63 @@ class Config:
                 self.timeout = self._to_integer("PVWA/" + k, configuration[k])
             elif keyname == "maxtasks" or keyname == "max_concurrent_tasks":
                 self.max_concurrent_tasks = self._to_integer("PVWA/" + k, configuration[k])
-                synonyme_max_concurrent_tasks += 1
+                synonym_max_concurrent_tasks += 1
             elif keyname == "keep_cookies":
-                self.keep_cookies = bool(configuration[k])
+                self.keep_cookies = self._to_bool("PVWA/" + k, configuration[k])
             elif keyname == "verify" or keyname == "ca":
                 self.PVWA_CA = configuration[k]
-                synonyme_PVWA_CA += 1
+                synonym_PVWA_CA += 1
             else:
                 raise AiobastionConfigurationException(f"Unknown attribute '{k}' within section 'PVWA' in {self.configfile}")
 
-        if synonyme_PVWA_CA > 1:
-            raise AiobastionConfigurationException(f"Duplicate synonyme parameter: 'ca', 'verify' within section 'PVWA' "
+        if synonym_PVWA_CA > 1:
+            raise AiobastionConfigurationException(f"Duplicate synonym parameter: 'ca', 'verify' within section 'PVWA' "
                                                    f"in {self.configfile}. Specify only one of them.")
 
-        if synonyme_max_concurrent_tasks > 1:
-            raise AiobastionConfigurationException(f"Duplicate synonyme parameter: 'maxtasks', 'max_concurrent_tasks' "
+        if synonym_max_concurrent_tasks > 1:
+            raise AiobastionConfigurationException(f"Duplicate synonym parameter: 'maxtasks', 'max_concurrent_tasks' "
                                                    f"within section 'PVWA' in {self.configfile}. "
                                                    f"Specify only one of them.")
 
     def _read_section_aim(self, configuration):
-        configuration_aim = {
-            "appid":                None,       # Default = Connection (appid)
-            "cert":                 None,
-            "host":                 None,       # Default = PVWA (host)
-            "key":                  None,
-            "passphrase":           None,
-            "max_concurrent_tasks": None,       # Default = PVWA (max_concurrent_tasks)
-            "verify":               False,       # Default = PVWA (PVWA_CA)
-            "keep_cookies":         False,      # Default = False
-            "timeout":              None,       # Default = PVWA (timeout)
+        self.AIM = EPV_AIM._init_validate_class_attributes(configuration, "AIM", self.configfile)
+
+        # Value that may come from PVWA
+        pvwa = {
+            "appid": self.AIM["appid"],
+            "host": self.PVWA,
+            "timeout": self.timeout,
+            "max_concurrent_tasks": self.max_concurrent_tasks,
+            "verify": self.PVWA_CA
         }
 
-        synonyme_verify = 0
-        synonyme_max_concurrent_tasks = 0
+        return EPV_AIM._init_complete_with_pvwa(self.options_modules["aim"], pvwa, "AIM", self.configfile)
 
+
+    def _read_section_account(self, module, configuration):
         for k in list(configuration.keys()):
             keyname = k.lower()
 
-            if keyname in ["appid", "cert", "host", "key", "passphrase"]:
-                configuration_aim[keyname] = configuration[k]
-            elif keyname == "timeout":
-                configuration_aim[keyname] = self._to_integer("AIM/" + k, configuration[k])
-            elif keyname == "keep_cookies":
-                configuration_aim[keyname] = bool(configuration[k])
-            elif keyname in ["maxtasks", "max_concurrent_tasks"]:
-                configuration_aim["max_concurrent_tasks"] = self._to_integer("AIM/" + k, configuration[k])
-                synonyme_max_concurrent_tasks += 1
-            elif keyname in ["ca", "verify"]:
-                configuration_aim["verify"] = configuration[k]
-                synonyme_verify += 1
+            if keyname == "logon_account_index":
+                self.options_modules[module][k] = self._to_integer(module + "/" + k, configuration[k])
+            elif keyname == "reconcile_account_index":
+                self.options_modules[module][k] = self._to_integer(module + "/" + k, configuration[k])
             else:
-                raise AiobastionConfigurationException(f"Unknown attribute '{k}' within section 'AIM' in {self.configfile}")
+                raise AiobastionConfigurationException(f"Unknown attribute '{k}' within section '{module}' "
+                                                       f"in {self.configfile}")
 
-        if synonyme_verify > 1:
-            raise AiobastionConfigurationException(f"Duplicate synonyme parameter: 'ca', 'verify' within section 'AIM'."
-                                                   f"Specify only one of them.")
 
-        if synonyme_max_concurrent_tasks > 1:
-            raise AiobastionConfigurationException(f"Duplicate synonyme parameter: 'maxtasks', 'max_concurrent_tasks' "
-                                                   f"within section 'AIM' in {self.configfile}."
-                                                   f"Specify only one of them.")
+    def _read_section_safe(self, module, configuration):
+        for k in list(configuration.keys()):
+            keyname = k.lower()
 
-        self.AIM = configuration_aim
-
-        # If not defined used Connection definitions to complete initialization.
-        if self.AIM["appid"] is None:
-            self.AIM["appid"]   = self.appid
-
-        # If not defined used PVWA definitions to complete initialization.
-        if self.AIM["host"] is None:
-            self.AIM["host"] = self.PVWA
-        if self.AIM["timeout"] is None:
-            self.AIM["timeout"] = self.timeout
-        if self.AIM["max_concurrent_tasks"] is None:
-            self.AIM["max_concurrent_tasks"] =  self.max_concurrent_tasks
-        if self.AIM["verify"] is None:
-            self.AIM["verify"] = self.PVWA_CA
+            if keyname == "cpm":
+                self.options_modules[module][k] = configuration[k]
+            elif keyname == "retention":
+                self.options_modules[module][k] = self._to_integer(module + "/" + k, configuration[k])
+            else:
+                raise AiobastionConfigurationException(f"Unknown attribute '{k}' within section '{module}' "
+                                                       f"in {self.configfile}")
 
     def _to_integer(self, section_key, val):
         try:
@@ -213,6 +234,25 @@ class Config:
 
         return v
 
+    def _to_bool(self, section_key, val):
+        if isinstance(val, bool):
+            v = val
+        elif isinstance(val, str):
+            # In case the value has been speficied has a string (see https://yaml.org/type/bool.html)
+            val = val.lower()
+
+            if val in ["y", "yes", "true", "on"]:
+                v = True
+            elif val in ["n", "no", "false", "off"]:
+                v = False
+            else:
+                raise AiobastionConfigurationException(f"Invalid boolean within '{section_key}'"
+                                    f" in {self.configfile}: {val!r}")
+        else:
+            raise AiobastionConfigurationException(f"Invalid boolean within '{section_key}'"
+                                                   f" in {self.configfile}: {val!r}")
+
+        return v
 
 # No rights at all
 DEFAULT_PERMISSIONS = {

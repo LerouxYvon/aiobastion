@@ -1,16 +1,86 @@
 # -*- coding: utf-8 -*-
 import warnings
-from typing import AsyncIterator
+from typing import AsyncIterator, Union
 
 from .config import permissions, DEFAULT_PERMISSIONS, get_v2_profile
 from .exceptions import (
-    CyberarkAPIException, CyberarkException, AiobastionException
+    CyberarkAPIException, CyberarkException, AiobastionException, AiobastionConfigurationException
 )
 
 
 class Safe:
-    def __init__(self, epv):
+    _SAFE_DEFAULT_CPM = None
+    _SAFE_DEFAULT_RETENTION = 10
+    _SERIALIZED_FIELDS = [  "cpm", "retention" ]
+
+    def __init__(self, epv, cpm = None, retention = None):
         self.epv = epv
+        self.cpm  = Safe._SAFE_DEFAULT_RETENTION
+        self.retention = Safe._SAFE_DEFAULT_RETENTION
+
+        if cpm is not None:
+            self.cmp = cpm
+
+        if retention is not None:
+            self.retention = retention
+
+    @classmethod
+    def _init_validate_class_attributes(cls, serialized: dict, section: str, configfile: str = None) -> dict:
+        """_init_validate_class_attributes      Initialize and validate the Safe definition (file configuration and serialized)
+
+        Arguments:
+            serialized {dict}           Safe defintion
+            section {str}               verified section name
+
+        Keyword Arguments:
+            configfile {str}            Name of the configuration file
+
+        Raises:
+            AiobastionConfigurationException
+
+        Returns:
+            d {dict}                    Safe defintion
+        """
+        d = {
+            "cpm": Safe._SAFE_DEFAULT_CPM,
+            "retention":  Safe._SAFE_DEFAULT_RETENTION
+            }
+
+        for k in serialized.keys():
+            keyname = k.lower()
+
+            try:
+                if keyname == "cpm":
+                    d[keyname] = serialized[k]
+                elif keyname == "retention":
+                    d[keyname] = int(serialized[k])
+                else:
+                    if configfile:
+                        s = f"Unknown attribute '{k}' within section '{section}' " + \
+                            f"in {configfile}"
+                    else:
+                        s = f"Unknown attribute '{k}' within section '{section}'"
+
+                    raise AiobastionConfigurationException(s)
+            except ValueError:
+                if configfile:
+                    s = f"Invalid integer defintion '{keyname}'  within section '{section}' in {configfile}: {serialized[k]!r}"
+                else:
+                    s = f"Invalid integer defintion '{keyname}'  within section '{section}': {serialized[k]!r}"
+
+                raise AiobastionConfigurationException(s)
+        return d
+
+
+    def to_json(self):
+        serialized = {}
+
+        for attr_name in Safe._SERIALIZED_FIELDS:
+            v = getattr(self, attr_name, None)
+
+            if v is not None:
+                serialized[attr_name] = v
+
 
     # TODO : add membershipExpirationDate permissions isReadOnly
     async def add_member(self, safe: str, username: str, search_in: str = "Vault",
@@ -106,7 +176,7 @@ class Safe:
         return await self.epv.handle_request("post", url, data=data)
 
     # TODO : Document profiles
-    async def add_member_profile(self, safe: str, username: str, profile: (str, dict)):
+    async def add_member_profile(self, safe: str, username: str, profile: Union[str, dict]):
         """
         This functions adds the "username" user (or group) to the given safe with a relevant profile
 
@@ -182,8 +252,8 @@ class Safe:
             "SafeName": safe_name,
             "Description": description,
             "OLACEnabled": olac,
-            "ManagingCPM": self.epv.cpm if cpm is None else cpm,
-            "NumberOfVersionsRetention": self.epv.retention if versions is None else versions,
+            "ManagingCPM": self.cpm if cpm is None else cpm,
+            "NumberOfVersionsRetention": self.retention if versions is None else versions,
             "numberOfDaysRetention": days,
             "AutoPurgeEnabled": auto_purge,
             "location": location
@@ -263,7 +333,7 @@ class Safe:
             members = await self.epv.handle_request("get", url, filter_func=lambda x: x["value"])
         except CyberarkException as err:
             raise CyberarkAPIException(404, "ERR_404", f"Safe {safe_name} doesn't exist")
-            
+
         if raw:
             return members
 
